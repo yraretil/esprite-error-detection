@@ -1,0 +1,320 @@
+<!doctype html>
+<html>
+    <head>
+        <meta charset="utf-8" />
+        <title>BCH Plotter</title>
+        <style>
+            * {
+                box-sizing: border-box;
+                margin: 0;
+                padding: 0;
+            }
+            body {
+                background: #111;
+                color: #ccc;
+                font: 13px monospace;
+                display: flex;
+                flex-direction: column;
+                height: 100vh;
+                overflow: hidden;
+            }
+
+            #topbar {
+                display: flex;
+                align-items: center;
+                gap: 20px;
+                padding: 8px 16px;
+                background: #1a1a1a;
+                border-bottom: 1px solid #2a2a2a;
+                flex-shrink: 0;
+                flex-wrap: wrap;
+            }
+
+            .toggle-btn {
+                display: flex;
+                align-items: center;
+                gap: 7px;
+                padding: 4px 12px;
+                border-radius: 20px;
+                border: 1.5px solid;
+                cursor: pointer;
+                font: 12px monospace;
+                transition:
+                    opacity 0.15s,
+                    background 0.15s;
+                user-select: none;
+            }
+            .toggle-btn .dot {
+                width: 9px;
+                height: 9px;
+                border-radius: 50%;
+            }
+            .toggle-btn.off {
+                opacity: 0.35;
+            }
+
+            #bch-state {
+                margin-left: auto;
+                font-size: 12px;
+                font-weight: bold;
+                padding: 4px 10px;
+                border-radius: 12px;
+                background: #222;
+                white-space: nowrap;
+            }
+
+            #controls {
+                display: flex;
+                align-items: center;
+                gap: 20px;
+                padding: 6px 16px;
+                background: #161616;
+                border-bottom: 1px solid #222;
+                flex-shrink: 0;
+            }
+            .ctrl {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                color: #888;
+            }
+            .ctrl input[type="range"] {
+                width: 120px;
+                accent-color: #666;
+            }
+            .ctrl span {
+                color: #ddd;
+                min-width: 52px;
+            }
+
+            #status {
+                font-size: 10px;
+                color: #444;
+                padding: 0 16px;
+                margin-left: auto;
+            }
+
+            canvas {
+                display: block;
+                flex: 1;
+                width: 100%;
+            }
+        </style>
+    </head>
+    <body>
+        <div id="topbar">
+            <div
+                class="toggle-btn"
+                id="btn-MicRaw"
+                style="border-color: #2dd4a0; background: #2dd4a01a"
+                onclick="toggle('MicRaw')"
+            >
+                <span class="dot" style="background: #2dd4a0"></span>MicRaw
+            </div>
+            <div
+                class="toggle-btn"
+                id="btn-Errored"
+                style="border-color: #f87171; background: #f871711a"
+                onclick="toggle('Errored')"
+            >
+                <span class="dot" style="background: #f87171"></span>Errored
+            </div>
+            <div
+                class="toggle-btn"
+                id="btn-Output"
+                style="border-color: #a78bfa; background: #a78bfa1a"
+                onclick="toggle('Output')"
+            >
+                <span class="dot" style="background: #a78bfa"></span>Output
+            </div>
+            <div id="bch-state">—</div>
+        </div>
+
+        <div id="controls">
+            <div class="ctrl">
+                <label>Y scale</label>
+                <input
+                    type="range"
+                    id="yscale"
+                    min="1000"
+                    max="32000"
+                    value="16000"
+                    step="500"
+                    oninput="
+                        yScale = +this.value;
+                        document.getElementById('yscale-val').textContent =
+                            '±' + yScale;
+                    "
+                />
+                <span id="yscale-val">±16000</span>
+            </div>
+            <div class="ctrl">
+                <label>Speed</label>
+                <input
+                    type="range"
+                    id="speed"
+                    min="1"
+                    max="8"
+                    value="2"
+                    step="1"
+                    oninput="
+                        pxPerSample = +this.value;
+                        document.getElementById('speed-val').textContent =
+                            this.value + 'px';
+                    "
+                />
+                <span id="speed-val">2px</span>
+            </div>
+            <div id="status">Connecting to ws://localhost:8765 ...</div>
+        </div>
+
+        <canvas id="c"></canvas>
+
+        <script>
+            const canvas = document.getElementById("c");
+            const ctx = canvas.getContext("2d");
+
+            const COLORS = {
+                MicRaw: "#2dd4a0",
+                Errored: "#f87171",
+                Output: "#a78bfa",
+            };
+            const KEYS = ["MicRaw", "Errored", "Output"];
+            const visible = { MicRaw: true, Errored: true, Output: true };
+
+            const BUF = 4096;
+            const bufs = {};
+            KEYS.forEach((k) => {
+                bufs[k] = new Float32Array(BUF);
+            });
+            let head = 0,
+                filled = 0;
+            let yScale = 16000,
+                pxPerSample = 2;
+            let rmsWindow = [];
+            const RMS_LEN = 150;
+
+            function resize() {
+                canvas.width = canvas.offsetWidth;
+                canvas.height = canvas.offsetHeight;
+            }
+            resize();
+            window.addEventListener("resize", resize);
+
+            function toggle(key) {
+                visible[key] = !visible[key];
+                document
+                    .getElementById("btn-" + key)
+                    .classList.toggle("off", !visible[key]);
+            }
+
+            function parseLine(line) {
+                const out = {};
+                line.split(",").forEach((part) => {
+                    const [k, v] = part.split(":");
+                    if (k && v !== undefined) out[k.trim()] = parseFloat(v);
+                });
+                return out;
+            }
+
+            function push(values) {
+                KEYS.forEach((k) => {
+                    bufs[k][head % BUF] = values[k] ?? 0;
+                });
+                head++;
+                if (filled < BUF) filled++;
+            }
+
+            function drawGrid() {
+                const W = canvas.width,
+                    H = canvas.height;
+                ctx.clearRect(0, 0, W, H);
+
+                const levels = [-1, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 1];
+                ctx.font = "10px monospace";
+                ctx.textAlign = "left";
+
+                levels.forEach((l) => {
+                    const y = Math.round(H / 2 - l * (H / 2 - 10));
+                    ctx.strokeStyle = l === 0 ? "#333" : "#1e1e1e";
+                    ctx.lineWidth = l === 0 ? 1 : 0.5;
+                    ctx.beginPath();
+                    ctx.moveTo(0, y);
+                    ctx.lineTo(W, y);
+                    ctx.stroke();
+                    if (l !== 0) {
+                        ctx.fillStyle = "#3a3a3a";
+                        ctx.fillText((l * yScale).toFixed(0), 4, y - 3);
+                    }
+                });
+            }
+
+            function drawWaveforms() {
+                const W = canvas.width,
+                    H = canvas.height;
+                const numSamples = Math.floor(W / pxPerSample);
+                const start = head - numSamples;
+                const mid = H / 2,
+                    range = H / 2 - 10;
+
+                KEYS.forEach((k) => {
+                    if (!visible[k]) return;
+                    ctx.strokeStyle = COLORS[k];
+                    ctx.lineWidth = 1.5;
+                    ctx.beginPath();
+                    let first = true;
+                    for (let i = 0; i < numSamples; i++) {
+                        const idx = (((start + i) % BUF) + BUF) % BUF;
+                        const x = i * pxPerSample;
+                        const y = mid - (bufs[k][idx] / yScale) * range;
+                        if (first) {
+                            ctx.moveTo(x, y);
+                            first = false;
+                        } else ctx.lineTo(x, y);
+                    }
+                    ctx.stroke();
+                });
+            }
+
+            function frame() {
+                drawGrid();
+                if (filled > 0) drawWaveforms();
+                requestAnimationFrame(frame);
+            }
+            frame();
+
+            const ws = new WebSocket("ws://localhost:8765");
+            const statusEl = document.getElementById("status");
+            const bchStateEl = document.getElementById("bch-state");
+
+            ws.onopen = () => {
+                statusEl.textContent = "Connected";
+            };
+            ws.onclose = () => {
+                statusEl.textContent = "Disconnected — restart python script";
+            };
+            ws.onerror = () => {
+                statusEl.textContent = "Error — is bridge.py running?";
+            };
+
+            ws.onmessage = (e) => {
+                const vals = parseLine(e.data);
+                push(vals);
+
+                if (vals.Output !== undefined && vals.MicRaw !== undefined) {
+                    const diff = (vals.Output - vals.MicRaw) ** 2;
+                    rmsWindow.push(diff);
+                    if (rmsWindow.length > RMS_LEN) rmsWindow.shift();
+                    const rms = Math.sqrt(
+                        rmsWindow.reduce((a, b) => a + b, 0) / rmsWindow.length,
+                    );
+                    const bchOn = rms < 5000;
+                    bchStateEl.textContent = bchOn
+                        ? "✓ BCH correcting"
+                        : "✗ BCH off — noise passing";
+                    bchStateEl.style.color = bchOn ? "#2dd4a0" : "#f87171";
+                }
+            };
+        </script>
+    </body>
+</html>
